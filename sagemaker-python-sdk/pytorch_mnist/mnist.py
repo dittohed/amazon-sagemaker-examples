@@ -4,7 +4,6 @@ import logging
 import os
 import sys
 
-#import sagemaker_containers
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -12,45 +11,54 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data
 import torch.utils.data.distributed
-from torchvision import datasets, transforms
+import torchvision
+
+from torchvision import transforms
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 logger.addHandler(logging.StreamHandler(sys.stdout))
 
 
-# Based on https://github.com/pytorch/examples/blob/master/mnist/main.py
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
-        self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
-        self.conv2_drop = nn.Dropout2d()
-        self.fc1 = nn.Linear(320, 50)
-        self.fc2 = nn.Linear(50, 10)
+        
+        self.model = torchvision.models.resnet50()
+        self.model.fc = nn.Linear(2048, 10)
 
     def forward(self, x):
-        x = F.relu(F.max_pool2d(self.conv1(x), 2))
-        x = F.relu(F.max_pool2d(self.conv2_drop(self.conv2(x)), 2))
-        x = x.view(-1, 320)
-        x = F.relu(self.fc1(x))
-        x = F.dropout(x, training=self.training)
-        x = self.fc2(x)
+        x = self.model(x)
         return F.log_softmax(x, dim=1)
 
 
-def _get_train_data_loader(batch_size, training_dir, is_distributed, **kwargs):
+def _get_train_data_loader(batch_size, root, is_distributed, **kwargs):
     logger.info("Get train data loader")
-    dataset = datasets.MNIST(
-        training_dir,
-        train=True,
-        transform=transforms.Compose(
-            [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
+
+    transform = [
+        transforms.ToTensor(),  # Handles conversion to float32 + dividing by 255
+        transforms.RandomResizedCrop(size=32, scale=(0.5, 1),
+                                    interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomApply(
+            [transforms.ColorJitter(brightness=0.4, contrast=0.4,
+                                    saturation=0.2, hue=0.1)],
+            p=0.8
         ),
-    )
+        transforms.RandomApply(
+            [transforms.GaussianBlur(kernel_size=3)],
+            p=0.5
+        ),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ]
+
+    dataset = torchvision.datasets.CIFAR10(root=root, train=True,
+                                        transform=transforms.Compose(transform))
     train_sampler = (
         torch.utils.data.distributed.DistributedSampler(dataset) if is_distributed else None
     )
+
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
@@ -60,24 +68,26 @@ def _get_train_data_loader(batch_size, training_dir, is_distributed, **kwargs):
     )
 
 
-def _get_test_data_loader(test_batch_size, training_dir, **kwargs):
+def _get_test_data_loader(batch_size, root, **kwargs):
     logger.info("Get test data loader")
+
+    transform = [
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ]
+
+    dataset = torchvision.datasets.CIFAR10(root=root, train=False,
+                                        transform=transforms.Compose(transform))
+
     return torch.utils.data.DataLoader(
-        datasets.MNIST(
-            training_dir,
-            train=False,
-            transform=transforms.Compose(
-                [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
-            ),
-        ),
-        batch_size=test_batch_size,
-        shuffle=True,
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
         **kwargs
     )
 
 
 def _average_gradients(model):
-    # Gradient averaging.
     size = float(dist.get_world_size())
     for param in model.parameters():
         dist.all_reduce(param.grad.data, op=dist.reduce_op.SUM)
@@ -106,7 +116,7 @@ def train(args):
             + "Current host rank is {}. Number of gpus: {}".format(dist.get_rank(), args.num_gpus)
         )
 
-    # set the seed for generating random numbers
+    # Set the seed for generating random numbers
     torch.manual_seed(args.seed)
     if use_cuda:
         torch.cuda.manual_seed(args.seed)
@@ -132,13 +142,14 @@ def train(args):
 
     model = Net().to(device)
     if is_distributed and use_cuda:
-        # multi-machine multi-gpu case
+        # Multi-machine multi-gpu case
         model = torch.nn.parallel.DistributedDataParallel(model)
     else:
-        # single-machine multi-gpu case or single-machine or multi-machine cpu case
+        # Single-machine multi-gpu case or single-machine or multi-machine cpu case
         model = torch.nn.DataParallel(model)
 
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+    best_test_acc = 0
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -146,10 +157,10 @@ def train(args):
             data, target = data.to(device), target.to(device)
             optimizer.zero_grad()
             output = model(data)
-            loss = F.nll_loss(output, target)
+            loss = F.nll_loss(output, target) 
             loss.backward()
             if is_distributed and not use_cuda:
-                # average gradients manually for multi-machine cpu case only
+                # Average gradients manually for multi-machine cpu case only
                 _average_gradients(model)
             optimizer.step()
             if batch_idx % args.log_interval == 0:
@@ -162,8 +173,12 @@ def train(args):
                         loss.item(),
                     )
                 )
-        test(model, test_loader, device)
+        test_acc = test(model, test_loader, device)
+        if test_acc > best_test_acc:
+            best_test_acc = test_acc 
     save_model(model, args.model_dir)
+
+    logger.info(f"Best test accuracy: {best_test_acc:.2f}%")
 
 
 def test(model, test_loader, device):
@@ -174,16 +189,19 @@ def test(model, test_loader, device):
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
             output = model(data)
-            test_loss += F.nll_loss(output, target, size_average=False).item()  # sum up batch loss
-            pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
+            test_loss += F.nll_loss(output, target, size_average=False).item()  # Sum up batch loss
+            pred = output.max(1, keepdim=True)[1]  # Get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
 
     test_loss /= len(test_loader.dataset)
+    accuracy = 100.0 * correct / len(test_loader.dataset)
     logger.info(
         "Test set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
-            test_loss, correct, len(test_loader.dataset), 100.0 * correct / len(test_loader.dataset)
+            test_loss, correct, len(test_loader.dataset), accuracy
         )
     )
+
+    return accuracy
 
 
 def model_fn(model_dir):
@@ -215,22 +233,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--test-batch-size",
         type=int,
-        default=1000,
+        default=64,
         metavar="N",
-        help="input batch size for testing (default: 1000)",
+        help="input batch size for testing (default: 64)",
     )
     parser.add_argument(
         "--epochs",
         type=int,
-        default=10,
+        default=100,
         metavar="N",
-        help="number of epochs to train (default: 10)",
+        help="number of epochs to train (default: 100)",
     )
     parser.add_argument(
-        "--lr", type=float, default=0.01, metavar="LR", help="learning rate (default: 0.01)"
+        "--lr", type=float, default=0.001, metavar="LR", help="learning rate (default: 0.001)"
     )
     parser.add_argument(
-        "--momentum", type=float, default=0.5, metavar="M", help="SGD momentum (default: 0.5)"
+        "--momentum", type=float, default=0.9, metavar="M", help="SGD momentum (default: 0.9)"
     )
     parser.add_argument("--seed", type=int, default=1, metavar="S", help="random seed (default: 1)")
     parser.add_argument(
