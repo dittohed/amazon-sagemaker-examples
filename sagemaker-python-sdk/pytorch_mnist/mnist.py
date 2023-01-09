@@ -53,7 +53,7 @@ def _get_train_data_loader(batch_size, root, is_distributed, **kwargs):
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
     ]
 
-    dataset = torchvision.datasets.CIFAR10(root=root, train=True,
+    dataset = torchvision.datasets.CIFAR10(root=root, train=True, download=True,
                                         transform=transforms.Compose(transform))
     train_sampler = (
         torch.utils.data.distributed.DistributedSampler(dataset) if is_distributed else None
@@ -266,10 +266,10 @@ if __name__ == "__main__":
     )
 
     # Container environment
-    parser.add_argument("--hosts", type=list, default=json.loads(os.environ["SM_HOSTS"]))
-    parser.add_argument("--current-host", type=str, default=os.environ["SM_CURRENT_HOST"])
-    parser.add_argument("--model-dir", type=str, default=os.environ["SM_MODEL_DIR"])
-    parser.add_argument("--data-dir", type=str, default=os.environ["SM_CHANNEL_TRAINING"])
-    parser.add_argument("--num-gpus", type=int, default=os.environ["SM_NUM_GPUS"])
+    parser.add_argument("--hosts", type=list)
+    parser.add_argument("--current-host", type=str)
+    parser.add_argument("--model-dir", type=str)
+    parser.add_argument("--data-dir", type=str)
+    parser.add_argument("--num-gpus", type=int)
 
     train(parser.parse_args())
